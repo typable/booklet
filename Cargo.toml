@@ -1,0 +1,9 @@
+[package]
+name = "booklet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.166", features = ["derive"] }
+terminal = "0.2.1"
+toml = "0.7.5"
