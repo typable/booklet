@@ -53,6 +53,11 @@ fn run() -> Result<()> {
         }
         if let Retrieved::Event(Some(event)) = term.get(Value::Event(None))? {
             match event {
+                Event::Resize => {
+                    if let Some((cols, rows)) = read_size(&mut term)? {
+                        state.resize_screen(cols as usize, rows as usize);
+                    }
+                }
                 Event::Key(key) => match key.code {
                     KeyCode::Char(char) => match char {
                         'q' => break,
