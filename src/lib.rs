@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
+const LICENSE_START: &str = "START OF THE PROJECT GUTENBERG";
+const LICENSE_END: &str = "END OF THE PROJECT GUTENBERG";
+
 pub type Error = Box<dyn std::error::Error>;
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -53,8 +56,9 @@ pub struct Book {
 
 impl Book {
     pub fn from_path(path: &str) -> Result<Self> {
-        let content = fs::read_to_string(path)?;
-        let content = Book::apply_modifiers(&content);
+        let mut content = fs::read_to_string(path)?;
+        content = Book::remove_license(&content);
+        content = Book::highlight_italic(&content);
         let lines = content
             .lines()
             .map(|line| line.to_string())
@@ -67,7 +71,27 @@ impl Book {
         })
     }
 
-    fn apply_modifiers(content: &str) -> String {
+    fn remove_license(content: &str) -> String {
+        if !content.contains(LICENSE_START) || !content.contains(LICENSE_END) {
+            return content.to_string();
+        }
+        let mut is_content = false;
+        let mut lines = Vec::new();
+        for line in content.lines() {
+            if line.contains(LICENSE_END) {
+                break;
+            }
+            if is_content {
+                lines.push(line);
+            }
+            if line.contains(LICENSE_START) {
+                is_content = true;
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn highlight_italic(content: &str) -> String {
         let mut open = false;
         let mut find_start = false;
         let mut chars = Vec::new();
