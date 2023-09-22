@@ -4,6 +4,7 @@ use std::io::Write;
 
 use booklet::Book;
 use booklet::Config;
+use booklet::Definition;
 use terminal::Action;
 use terminal::Clear;
 use terminal::Event;
@@ -21,13 +22,14 @@ use booklet::State;
 
 const OFFSET: usize = 15;
 
-fn main() {
-    if let Err(err) = run() {
+#[async_std::main]
+async fn main() {
+    if let Err(err) = run().await {
         println!("{err}");
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let mut args = env::args().skip(1);
     let path = match args.next() {
         Some(path) => path,
@@ -58,64 +60,90 @@ fn run() -> Result<()> {
                         state.resize_screen(cols as usize, rows as usize);
                     }
                 }
-                Event::Key(key) => match key.code {
-                    KeyCode::Char(char) => match char {
-                        'q' => break,
-                        'j' => state.move_down(),
-                        'k' => state.move_up(),
-                        'g' => {
-                            if let Some(key) = read_key(&mut term)? {
-                                match key.code {
-                                    KeyCode::Esc => break,
-                                    KeyCode::Char(char) => match char {
-                                        'g' => state.goto_top(),
-                                        'e' => state.goto_bottom(),
-                                        'n' => state.goto_next_bookmark(),
-                                        'p' => state.goto_prev_bookmark(),
-                                        _ => (),
-                                    },
-                                    _ => (),
-                                }
-                            }
-                        }
-                        'x' => {
-                            let line_number = state.line_number;
-                            if state.has_bookmark(line_number) {
-                                state.remove_bookmark(line_number)?;
-                            } else {
-                                state.add_bookmark(line_number)?;
-                            }
-                        }
-                        'm' => {
-                            if let Some(selection) = state.selection {
-                                match state
-                                    .config
-                                    .markers
-                                    .iter()
-                                    .position(|item| item == &selection)
-                                {
-                                    Some(index) => {
-                                        state.config.markers.remove(index);
-                                    }
-                                    None => {
-                                        state.config.markers.push(selection);
+                Event::Key(key) => {
+                    match key.code {
+                        KeyCode::Char(char) => {
+                            match char {
+                                'q' => break,
+                                'j' => state.move_down(),
+                                'k' => state.move_up(),
+                                'g' => {
+                                    if let Some(key) = read_key(&mut term)? {
+                                        match key.code {
+                                            KeyCode::Esc => break,
+                                            KeyCode::Char(char) => match char {
+                                                'g' => state.goto_top(),
+                                                'e' => state.goto_bottom(),
+                                                'n' => state.goto_next_bookmark(),
+                                                'p' => state.goto_prev_bookmark(),
+                                                _ => (),
+                                            },
+                                            _ => (),
+                                        }
                                     }
                                 }
-                                state.config.write(&path)?;
-                                render(&mut term, &state)?;
+                                'x' => {
+                                    let line_number = state.line_number;
+                                    if state.has_bookmark(line_number) {
+                                        state.remove_bookmark(line_number)?;
+                                    } else {
+                                        state.add_bookmark(line_number)?;
+                                    }
+                                }
+                                'd' => {
+                                    if let Some(selection) = state.selection {
+                                        let (pos, start, end) = selection;
+                                        let line = state.book.lines.get(pos).unwrap();
+                                        let word = &line[start..end];
+                                        let url = format!("https://api.dictionaryapi.dev/api/v2/entries/en/{word}");
+                                        let res = reqwest::get(url).await?;
+                                        let result: serde_json::Value = res.json().await?;
+                                        if let Some(definition) = Definition::from_json(&result) {
+                                            state.definition = Some((selection, definition));
+                                            render(&mut term, &state)?;
+                                        }
+                                    }
+                                }
+                                'f' => {
+                                    state.focus_mode = !state.focus_mode;
+                                    render(&mut term, &state)?;
+                                }
+                                // 'm' => {
+                                //     if let Some(selection) = state.selection {
+                                //         match state
+                                //             .config
+                                //             .markers
+                                //             .iter()
+                                //             .position(|item| item == &selection)
+                                //         {
+                                //             Some(index) => {
+                                //                 state.config.markers.remove(index);
+                                //             }
+                                //             None => {
+                                //                 state.config.markers.push(selection);
+                                //             }
+                                //         }
+                                //         state.config.write(&path)?;
+                                //         render(&mut term, &state)?;
+                                //     }
+                                // }
+                                _ => (),
                             }
+                        }
+                        KeyCode::Esc => {
+                            state.clear_selection();
+                            state.definition = None;
+                            render(&mut term, &state)?;
                         }
                         _ => (),
-                    },
-                    KeyCode::Esc => state.clear_selection(),
-                    _ => (),
-                },
+                    }
+                }
                 Event::Mouse(MouseEvent::Up(MouseButton::Left, col, row, _)) => {
                     let col = col as usize;
                     let row = row as usize;
                     let pos = (state.line_number + row).saturating_sub(OFFSET);
                     if col >= state.pad_left + 8 {
-                        let col = col.saturating_sub(state.pad_left).saturating_sub(8);
+                        let col = col.saturating_sub(state.pad_left).saturating_sub(10);
                         if let Some(line) = state.book.lines.get(pos) {
                             let line = line.replace("\x1b[4m", "");
                             let chars = line.chars().collect::<Vec<_>>();
@@ -200,6 +228,16 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                 let mut line = line.to_string();
                 let line_number = pos;
                 let is_bookmarked = state.config.bookmarks.contains(&line_number);
+                let mut line_color = if state.focus_mode {
+                    match i {
+                        i if i + 1 == OFFSET => "\x1b[38;2;160;160;160m",
+                        i if i == OFFSET => "\x1b[38;2;240;240;240m",
+                        i if i == OFFSET + 1 => "\x1b[38;2;160;160;160m",
+                        _ => "\x1b[38;2;100;100;100m",
+                    }
+                } else {
+                    "\x1b[38;2;240;240;240m"
+                };
                 // insert selections
                 if let Some(selection) = &state.selection {
                     let (row, start, end) = selection;
@@ -244,17 +282,39 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                         Codes::RESET_UNDERLINE => slices.push("\x1b[24m".to_string()),
                         Codes::BACKGROUND_MARKER => slices.push("\x1b[48;2;90;90;0m".to_string()),
                         Codes::BACKGROUND_SELECTION => {
-                            slices.push("\x1b[48;2;100;100;100m".to_string())
+                            slices.push("\x1b[48;2;100;100;100m".to_string());
+                            slices.push("\x1b[38;2;240;240;240m".to_string())
                         }
-                        Codes::RESET_BACKGROUND => slices.push("\x1b[49m".to_string()),
+                        Codes::RESET_BACKGROUND => {
+                            slices.push("\x1b[49m".to_string());
+                            slices.push(line_color.to_string())
+                        }
                         _ => slices.push(char.to_string()),
                     }
                 }
                 line = slices.join("");
+                if let Some(definition) = &state.definition {
+                    let ((row, _, _), definition) = definition;
+                    if row + 1 == pos {
+                        line = "".to_string();
+                        line_color = "\x1b[38;2;240;240;240m";
+                    }
+                    if row + 1 < pos && row + 1 + definition.list.len() >= pos {
+                        let index = pos.saturating_sub(row + 2);
+                        if let Some(item) = definition.list.get(index) {
+                            line = format!("\x1b[38;2;160;160;160m  {}. {item}\x1b[0m", index + 1);
+                            line_color = "\x1b[38;2;240;240;240m";
+                        }
+                    }
+                    if row + 1 + definition.list.len() + 1 == pos {
+                        line = "".to_string();
+                        line_color = "\x1b[38;2;240;240;240m";
+                    }
+                }
                 term.flush_batch()?;
                 term.write_all(
                     format!(
-                        "{: >pad_left$}{}{: >5} \x1b[0m  {}\x1b[38;2;240;240;240m{line}\x1b[0m",
+                        "{: >pad_left$}{}{: >5} {}\x1b[0m {}{line}\x1b[0m",
                         "",
                         if i == OFFSET {
                             "\x1b[38;2;200;200;0m"
@@ -267,10 +327,11 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                             String::default()
                         },
                         if is_bookmarked {
-                            "\x1b[48;2;90;90;0m"
+                            "\x1b[38;2;240;240;240m>>>\x1b[0m"
                         } else {
-                            ""
+                            "   "
                         },
+                        line_color,
                         pad_left = state.pad_left,
                     )
                     .as_bytes(),

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
@@ -14,6 +15,43 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Config {
     pub bookmarks: Vec<usize>,
     pub markers: Vec<(usize, usize, usize)>,
+}
+
+#[derive(Debug)]
+pub struct Definition {
+    pub word: String,
+    pub list: Vec<String>,
+}
+
+impl Definition {
+    pub fn from_json(value: &serde_json::Value) -> Option<Definition> {
+        let entry = value.as_array()?.get(0)?;
+        let word = entry.get("word")?.as_str()?;
+        let mut list = Vec::new();
+        let meanings = entry.get("meanings")?.as_array()?;
+        for meaning in meanings {
+            let definitions = meaning.get("definitions")?.as_array()?;
+            for definition in definitions {
+                let sentence = definition.get("definition")?.as_str()?;
+                list.push(sentence.to_string());
+            }
+        }
+        Some(Definition {
+            word: word.to_string(),
+            list,
+        })
+    }
+}
+
+impl fmt::Display for Definition {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.word)?;
+        writeln!(f)?;
+        for (i, item) in self.list.iter().enumerate() {
+            write!(f, "{i}. {item}")?;
+        }
+        Ok(())
+    }
 }
 
 impl Config {
@@ -133,6 +171,8 @@ pub struct State {
     pub selection: Option<(usize, usize, usize)>,
     pub pad_left: usize,
     pub update_screen: bool,
+    pub definition: Option<((usize, usize, usize), Definition)>,
+    pub focus_mode: bool,
 }
 
 impl State {
@@ -147,6 +187,8 @@ impl State {
             selection: None,
             pad_left: 0,
             update_screen: false,
+            definition: None,
+            focus_mode: false,
         }
     }
 
@@ -231,6 +273,7 @@ impl State {
             .any(|item| item == &line_number)
         {
             self.config.bookmarks.push(line_number);
+            self.config.bookmarks.sort();
             self.config.write(&self.path)?;
             self.update_screen();
         }
