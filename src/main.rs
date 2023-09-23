@@ -4,7 +4,7 @@ use std::io::Write;
 
 use booklet::Book;
 use booklet::Config;
-use booklet::Definition;
+
 use terminal::Action;
 use terminal::Clear;
 use terminal::Event;
@@ -17,7 +17,6 @@ use terminal::Terminal;
 use terminal::Value;
 
 use booklet::Codes;
-use booklet::Result;
 use booklet::State;
 
 const OFFSET: usize = 15;
@@ -29,7 +28,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     let path = match args.next() {
         Some(path) => path,
@@ -82,32 +81,9 @@ async fn run() -> Result<()> {
                                         }
                                     }
                                 }
-                                'x' => {
-                                    let line_number = state.line_number;
-                                    if state.has_bookmark(line_number) {
-                                        state.remove_bookmark(line_number)?;
-                                    } else {
-                                        state.add_bookmark(line_number)?;
-                                    }
-                                }
-                                'd' => {
-                                    if let Some(selection) = state.selection {
-                                        let (pos, start, end) = selection;
-                                        let line = state.book.lines.get(pos).unwrap();
-                                        let word = &line[start..end];
-                                        let url = format!("https://api.dictionaryapi.dev/api/v2/entries/en/{word}");
-                                        let res = reqwest::get(url).await?;
-                                        let result: serde_json::Value = res.json().await?;
-                                        if let Some(definition) = Definition::from_json(&result) {
-                                            state.definition = Some((selection, definition));
-                                            render(&mut term, &state)?;
-                                        }
-                                    }
-                                }
-                                'f' => {
-                                    state.focus_mode = !state.focus_mode;
-                                    render(&mut term, &state)?;
-                                }
+                                'x' => state.toggle_bookmark(state.line_number)?,
+                                'd' => state.define_selection().await?,
+                                'f' => state.toggle_focus_mode()?,
                                 // 'm' => {
                                 //     if let Some(selection) = state.selection {
                                 //         match state
@@ -132,8 +108,9 @@ async fn run() -> Result<()> {
                         }
                         KeyCode::Esc => {
                             state.clear_selection();
-                            state.definition = None;
-                            render(&mut term, &state)?;
+                            state.clear_definition();
+                            state.clear_message();
+                            state.message = None;
                         }
                         _ => (),
                     }
@@ -170,10 +147,7 @@ async fn run() -> Result<()> {
                                         }
                                         end = chars.len();
                                     }
-                                    if state.selection != Some((pos, start, end)) {
-                                        state.selection = Some((pos, start, end));
-                                        render(&mut term, &state)?;
-                                    }
+                                    state.set_selection((pos, start, end));
                                 }
                                 // mark numbers
                                 if char.is_numeric() {
@@ -197,10 +171,7 @@ async fn run() -> Result<()> {
                                         }
                                         end = chars.len();
                                     }
-                                    if state.selection != Some((pos, start, end)) {
-                                        state.selection = Some((pos, start, end));
-                                        render(&mut term, &state)?;
-                                    }
+                                    state.set_selection((pos, start, end));
                                 }
                             }
                         }
@@ -218,7 +189,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
+fn render(term: &mut Terminal<Stdout>, state: &State) -> anyhow::Result<()> {
     for i in 0..state.screen_height {
         term.act(Action::MoveCursorTo(0, i as u16))?;
         term.batch(Action::ClearTerminal(Clear::CurrentLine))?;
@@ -228,7 +199,8 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                 let mut line = line.to_string();
                 let line_number = pos;
                 let is_bookmarked = state.config.bookmarks.contains(&line_number);
-                let mut line_color = if state.focus_mode {
+                // determine line color
+                let mut line_color = if state.config.focus_mode.unwrap_or_default() {
                     match i {
                         i if i + 1 == OFFSET => "\x1b[38;2;160;160;160m",
                         i if i == OFFSET => "\x1b[38;2;240;240;240m",
@@ -272,6 +244,7 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                         line = chars.iter().collect();
                     }
                 }
+                // insert formatting codes
                 let mut slices = Vec::new();
                 for char in line.chars() {
                     match char {
@@ -293,6 +266,7 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                     }
                 }
                 line = slices.join("");
+                // render definition
                 if let Some(definition) = &state.definition {
                     let ((row, _, _), definition) = definition;
                     if row + 1 == pos {
@@ -308,6 +282,21 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
                     }
                     if row + 1 + definition.list.len() + 1 == pos {
                         line = "".to_string();
+                        line_color = "\x1b[38;2;240;240;240m";
+                    }
+                }
+                // render message
+                if let Some(message) = &state.message {
+                    if i == state.screen_height.saturating_sub(2) {
+                        line = format!(
+                            "{:-<line_width$}",
+                            "",
+                            line_width = state.book.line_width.saturating_sub(10)
+                        );
+                        line_color = "\x1b[38;2;160;160;160m";
+                    }
+                    if i == state.screen_height.saturating_sub(1) {
+                        line = message.to_string();
                         line_color = "\x1b[38;2;240;240;240m";
                     }
                 }
@@ -343,14 +332,14 @@ fn render(term: &mut Terminal<Stdout>, state: &State) -> Result<()> {
     Ok(())
 }
 
-fn read_key(term: &mut Terminal<Stdout>) -> Result<Option<KeyEvent>> {
+fn read_key(term: &mut Terminal<Stdout>) -> anyhow::Result<Option<KeyEvent>> {
     if let Retrieved::Event(Some(Event::Key(key))) = term.get(Value::Event(None))? {
         return Ok(Some(key));
     }
     Ok(None)
 }
 
-fn read_size(term: &mut Terminal<Stdout>) -> Result<Option<(u16, u16)>> {
+fn read_size(term: &mut Terminal<Stdout>) -> anyhow::Result<Option<(u16, u16)>> {
     if let Retrieved::TerminalSize(cols, rows) = term.get(Value::TerminalSize)? {
         return Ok(Some((cols, rows)));
     }

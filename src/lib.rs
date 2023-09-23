@@ -8,13 +8,11 @@ use serde::Serialize;
 const LICENSE_START: &str = "START OF THE PROJECT GUTENBERG";
 const LICENSE_END: &str = "END OF THE PROJECT GUTENBERG";
 
-pub type Error = Box<dyn std::error::Error>;
-pub type Result<T> = std::result::Result<T, Error>;
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub bookmarks: Vec<usize>,
     pub markers: Vec<(usize, usize, usize)>,
+    pub focus_mode: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -55,7 +53,7 @@ impl fmt::Display for Definition {
 }
 
 impl Config {
-    pub fn from_path(path: &str) -> Result<Self> {
+    pub fn from_path(path: &str) -> anyhow::Result<Self> {
         let mut path_buf = PathBuf::from(path);
         if let Some(filename) = path_buf.file_name() {
             let filename = filename.to_os_string().into_string().unwrap();
@@ -72,7 +70,7 @@ impl Config {
         Ok(Config::default())
     }
 
-    pub fn write(&self, path: &str) -> Result<()> {
+    pub fn write(&self, path: &str) -> anyhow::Result<()> {
         let mut path_buf = PathBuf::from(path);
         if let Some(filename) = path_buf.file_name() {
             let filename = filename.to_os_string().into_string().unwrap();
@@ -93,7 +91,7 @@ pub struct Book {
 }
 
 impl Book {
-    pub fn from_path(path: &str) -> Result<Self> {
+    pub fn from_path(path: &str) -> anyhow::Result<Self> {
         let mut content = fs::read_to_string(path)?;
         content = Book::remove_license(&content);
         content = Book::highlight_italic(&content);
@@ -168,11 +166,11 @@ pub struct State {
     pub screen_width: usize,
     pub screen_height: usize,
     pub line_number: usize,
-    pub selection: Option<(usize, usize, usize)>,
     pub pad_left: usize,
     pub update_screen: bool,
+    pub selection: Option<(usize, usize, usize)>,
     pub definition: Option<((usize, usize, usize), Definition)>,
-    pub focus_mode: bool,
+    pub message: Option<String>,
 }
 
 impl State {
@@ -188,7 +186,7 @@ impl State {
             pad_left: 0,
             update_screen: false,
             definition: None,
-            focus_mode: false,
+            message: None,
         }
     }
 
@@ -251,11 +249,62 @@ impl State {
         }
     }
 
+    pub fn get_text(&self, (pos, start, end): (usize, usize, usize)) -> Option<String> {
+        let line = self.book.lines.get(pos)?;
+        let text = line.get(start..end)?.to_string();
+        Some(text)
+    }
+
+    pub fn set_selection(&mut self, selection: (usize, usize, usize)) {
+        if !self
+            .selection
+            .is_some_and(|sel| sel.0 == selection.0 && sel.1 == selection.1 && sel.2 == selection.2)
+        {
+            self.selection = Some(selection);
+            self.update_screen();
+        }
+    }
+
+    pub fn get_selection(&mut self) -> Option<(usize, usize, usize)> {
+        self.selection
+    }
+
     pub fn clear_selection(&mut self) {
         if self.selection.is_some() {
             self.selection = None;
             self.update_screen();
         }
+    }
+
+    pub fn clear_definition(&mut self) {
+        if self.definition.is_some() {
+            self.definition = None;
+            self.update_screen();
+        }
+    }
+
+    pub fn clear_message(&mut self) {
+        if self.message.is_some() {
+            self.message = None;
+            self.update_screen();
+        }
+    }
+
+    pub fn toggle_focus_mode(&mut self) -> anyhow::Result<()> {
+        self.config.focus_mode = Some(!self.config.focus_mode.unwrap_or_default());
+        self.config.write(&self.path)?;
+        self.show_message("(i) Toggled focus mode");
+        self.update_screen();
+        Ok(())
+    }
+
+    pub fn toggle_bookmark(&mut self, line_number: usize) -> anyhow::Result<()> {
+        if self.has_bookmark(line_number) {
+            self.remove_bookmark(line_number)?;
+        } else {
+            self.add_bookmark(line_number)?;
+        }
+        Ok(())
     }
 
     pub fn has_bookmark(&mut self, line_number: usize) -> bool {
@@ -265,7 +314,7 @@ impl State {
             .any(|item| item == &line_number)
     }
 
-    pub fn add_bookmark(&mut self, line_number: usize) -> Result<()> {
+    pub fn add_bookmark(&mut self, line_number: usize) -> anyhow::Result<()> {
         if !self
             .config
             .bookmarks
@@ -275,12 +324,13 @@ impl State {
             self.config.bookmarks.push(line_number);
             self.config.bookmarks.sort();
             self.config.write(&self.path)?;
+            self.show_message("(i) Added bookmark");
             self.update_screen();
         }
         Ok(())
     }
 
-    pub fn remove_bookmark(&mut self, line_number: usize) -> Result<()> {
+    pub fn remove_bookmark(&mut self, line_number: usize) -> anyhow::Result<()> {
         if let Some(index) = self
             .config
             .bookmarks
@@ -289,9 +339,45 @@ impl State {
         {
             self.config.bookmarks.remove(index);
             self.config.write(&self.path)?;
+            self.show_message("(i) Removed bookmark");
             self.update_screen();
         }
         Ok(())
+    }
+
+    pub async fn define_selection(&mut self) -> anyhow::Result<()> {
+        let selection = match self.selection {
+            Some(selection) => selection,
+            None => {
+                self.show_message("(i) No selection found");
+                return Ok(());
+            }
+        };
+        let text = match self.get_text(selection) {
+            Some(text) => text,
+            None => {
+                self.show_message("(i) No text at specified selection");
+                return Ok(());
+            }
+        };
+        let url = format!("https://api.dictionaryapi.dev/api/v2/entries/en/{text}");
+        let res = reqwest::get(url).await?;
+        let result: serde_json::Value = res.json().await?;
+        let definition = match Definition::from_json(&result) {
+            Some(definition) => definition,
+            None => {
+                self.show_message("(i) No definition found");
+                return Ok(());
+            }
+        };
+        self.definition = Some((selection, definition));
+        self.update_screen();
+        Ok(())
+    }
+
+    pub fn show_message(&mut self, message: &str) {
+        self.message = Some(message.to_string());
+        self.update_screen();
     }
 }
 
